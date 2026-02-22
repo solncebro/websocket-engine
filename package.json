@@ -1,0 +1,28 @@
+{
+  "name": "@solncebro/websocket-engine",
+  "version": "0.1.0",
+  "description": "Reliable WebSocket client with reconnect, heartbeat and typed messages",
+  "license": "ISC",
+  "repository": { "type": "git", "url": "https://github.com/solncebro/websocket-engine" },
+  "keywords": ["websocket", "reconnect", "heartbeat"],
+  "engines": { "node": ">=16" },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "prepublishOnly": "yarn build"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/ws": "^8.5.10",
+    "typescript": "^5.4.5"
+  }
+}
