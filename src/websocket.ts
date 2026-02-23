@@ -21,7 +21,7 @@ interface PendingWaiter<TMessage> {
   predicate: (message: TMessage) => boolean;
   resolve: (message: TMessage) => void;
   reject: (error: Error) => void;
-  timeoutIdentifier: NodeJS.Timeout;
+  timeoutId: NodeJS.Timeout;
 }
 
 class ReliableWebSocket<TMessage = RawData> {
@@ -74,24 +74,14 @@ class ReliableWebSocket<TMessage = RawData> {
     return this.url;
   }
 
-  public send(data: unknown): void {
-    if (this.connectionInfo.status !== WebSocketStatus.CONNECTED) {
-      throw new Error(
-        `[${this.label}] Cannot send: status is ${this.connectionInfo.status}`
-      );
-    }
-
-    this.sendToSocket(data);
-  }
-
   public waitForMessage(
     predicate: (message: TMessage) => boolean,
     timeoutMilliseconds: number
   ): Promise<TMessage> {
     return new Promise((resolve, reject) => {
-      const timeoutIdentifier = setTimeout(() => {
+      const timeoutId = setTimeout(() => {
         const index = this.pendingWaiterList.findIndex(
-          (waiter) => waiter.timeoutIdentifier === timeoutIdentifier
+          (waiter) => waiter.timeoutId === timeoutId
         );
 
         if (index !== -1) {
@@ -109,7 +99,7 @@ class ReliableWebSocket<TMessage = RawData> {
         predicate,
         resolve,
         reject,
-        timeoutIdentifier,
+        timeoutId,
       });
     });
   }
@@ -128,7 +118,17 @@ class ReliableWebSocket<TMessage = RawData> {
     }
   }
 
-  private sendToSocket(data: unknown): void {
+  public sendToConnectedSocket(data: unknown): void {
+    if (this.connectionInfo.status !== WebSocketStatus.CONNECTED) {
+      throw new Error(
+        `[${this.label}] Cannot send: status is ${this.connectionInfo.status}`
+      );
+    }
+
+    this.sendToOpenedSocket(data);
+  }
+
+  private sendToOpenedSocket(data: unknown): void {
     if (
       !this.currentWebSocket ||
       this.currentWebSocket.readyState !== WebSocket.OPEN
@@ -140,7 +140,7 @@ class ReliableWebSocket<TMessage = RawData> {
     this.currentWebSocket.send(payload);
   }
 
-  private fireNotify(message: string): void {
+  private notify(message: string): void {
     const result = this.onNotify?.(message);
 
     if (result instanceof Promise) {
@@ -150,11 +150,19 @@ class ReliableWebSocket<TMessage = RawData> {
     }
   }
 
+  private formatRetryAttemptMessage(prefix: string, suffix?: string): string {
+    const attemptPart = `(attempt ${this.connectionInfo.retryCount}/${this.configuration.maxRetryAttempts}`;
+    const fullAttempt =
+      suffix !== undefined ? `${attemptPart}, ${suffix})` : `${attemptPart})`;
+
+    return `[${this.label}] ${prefix} ${fullAttempt}`;
+  }
+
   private rejectPendingWaiters(reason: string): void {
     const error = new Error(reason);
 
     this.pendingWaiterList.forEach((waiter) => {
-      clearTimeout(waiter.timeoutIdentifier);
+      clearTimeout(waiter.timeoutId);
       waiter.reject(error);
     });
 
@@ -176,7 +184,7 @@ class ReliableWebSocket<TMessage = RawData> {
   }
 
   private scheduleReconnect(delay: number): void {
-    this.connectionInfo.reconnectTimeout = setTimeout(() => {
+    this.connectionInfo.reconnectTimeoutId = setTimeout(() => {
       this.performReconnect().catch((error) => {
         this.logger.error(`[${this.label}] Unexpected error in reconnect: ${String(error)}`);
       });
@@ -196,16 +204,15 @@ class ReliableWebSocket<TMessage = RawData> {
 
     this.rejectPendingWaiters(`[${this.label}] Connection disrupted`);
 
-    if (errorMessage) {
-      const message = `[${this.label}] Connection error: ${errorMessage}, consecutive failures: ${this.connectionInfo.consecutiveFailures}`;
-      this.logger.error(message);
-      this.fireNotify(message);
-    } else {
-      const codeText = closeCode !== undefined ? `code ${closeCode}` : "unknown";
-      const message = `[${this.label}] Connection closed (${codeText}), consecutive failures: ${this.connectionInfo.consecutiveFailures}`;
-      this.logger.warn(message);
-      this.fireNotify(message);
-    }
+    const failureSuffix = `, consecutive failures: ${this.connectionInfo.consecutiveFailures}`;
+    const codeText = closeCode !== undefined ? `code ${closeCode}` : "unknown";
+    const message = errorMessage
+      ? `[${this.label}] Connection error: ${errorMessage}${failureSuffix}`
+      : `[${this.label}] Connection closed (${codeText})${failureSuffix}`;
+    const level = errorMessage ? "error" : "warn";
+
+    this.logger[level](message);
+    this.notify(message);
 
     const delay = calcReconnectDelay(
       this.connectionInfo.consecutiveFailures,
@@ -225,7 +232,10 @@ class ReliableWebSocket<TMessage = RawData> {
     this.connectionInfo.retryCount++;
 
     this.logger.info(
-      `[${this.label}] Reconnecting (attempt ${this.connectionInfo.retryCount}/${this.configuration.maxRetryAttempts}, consecutive failures: ${this.connectionInfo.consecutiveFailures})`
+      this.formatRetryAttemptMessage(
+        "Reconnecting",
+        `consecutive failures: ${this.connectionInfo.consecutiveFailures}`
+      )
     );
 
     if (this.connectionInfo.retryCount > this.configuration.maxRetryAttempts) {
@@ -277,16 +287,16 @@ class ReliableWebSocket<TMessage = RawData> {
   }
 
   private setupHeartbeat(websocket: WebSocket): void {
-    clearInterval(this.connectionInfo.pingInterval);
-    clearTimeout(this.connectionInfo.pongTimeout);
-    this.connectionInfo.pingInterval = undefined;
-    this.connectionInfo.pongTimeout = undefined;
+    clearInterval(this.connectionInfo.pingIntervalId);
+    clearTimeout(this.connectionInfo.pongTimeoutId);
+    this.connectionInfo.pingIntervalId = undefined;
+    this.connectionInfo.pongTimeoutId = undefined;
     this.connectionInfo.missedPongCount = 0;
     this.connectionInfo.lastPongReceivedAt = Date.now();
 
     const heartbeat = this.heartbeat;
     const sendApplicationPing = heartbeat
-      ? () => this.sendToSocket(heartbeat.buildPayload())
+      ? () => this.sendToOpenedSocket(heartbeat.buildPayload())
       : undefined;
 
     const sendPing = (): void => {
@@ -297,7 +307,7 @@ class ReliableWebSocket<TMessage = RawData> {
       try {
         sendApplicationPing ? sendApplicationPing() : websocket.ping();
 
-        this.connectionInfo.pongTimeout = setTimeout(() => {
+        this.connectionInfo.pongTimeoutId = setTimeout(() => {
           this.connectionInfo.missedPongCount++;
 
           if (
@@ -324,13 +334,13 @@ class ReliableWebSocket<TMessage = RawData> {
       websocket.on("pong", () => {
         this.connectionInfo.missedPongCount = 0;
         this.connectionInfo.lastPongReceivedAt = Date.now();
-        clearTimeout(this.connectionInfo.pongTimeout);
-        this.connectionInfo.pongTimeout = undefined;
+        clearTimeout(this.connectionInfo.pongTimeoutId);
+        this.connectionInfo.pongTimeoutId = undefined;
       });
     }
 
     setTimeout(sendPing, this.configuration.heartbeatGracePeriod);
-    this.connectionInfo.pingInterval = setInterval(
+    this.connectionInfo.pingIntervalId = setInterval(
       sendPing,
       this.configuration.pingInterval
     );
@@ -343,18 +353,20 @@ class ReliableWebSocket<TMessage = RawData> {
 
     this.currentWebSocket = websocket;
 
-    this.connectionInfo.connectionTimeout = setTimeout(() => {
+    this.connectionInfo.connectionTimeoutId = setTimeout(() => {
       if (websocket.readyState === WebSocket.CONNECTING) {
-        const message = `[${this.label}] Connection timeout after ${this.configuration.connectionTimeout}ms (attempt ${this.connectionInfo.retryCount}/${this.configuration.maxRetryAttempts})`;
+        const message = this.formatRetryAttemptMessage(
+          `Connection timeout after ${this.configuration.connectionTimeout}ms`
+        );
         this.logger.warn(message);
-        this.fireNotify(message);
+        this.notify(message);
         websocket.terminate();
       }
     }, this.configuration.connectionTimeout);
 
     websocket.on("open", () => {
-      clearTimeout(this.connectionInfo.connectionTimeout);
-      this.connectionInfo.connectionTimeout = undefined;
+      clearTimeout(this.connectionInfo.connectionTimeoutId);
+      this.connectionInfo.connectionTimeoutId = undefined;
 
       const afterOpen = (): void => {
         this.connectionInfo.status = WebSocketStatus.CONNECTED;
@@ -379,9 +391,8 @@ class ReliableWebSocket<TMessage = RawData> {
 
       if (this.onOpen) {
         const openContext: WebSocketOpenContext<TMessage> = {
-          send: (data) => this.sendToSocket(data),
-          waitForMessage: (predicate, timeoutMilliseconds) =>
-            this.waitForMessage(predicate, timeoutMilliseconds),
+          send: this.sendToOpenedSocket.bind(this),
+          waitForMessage: this.waitForMessage.bind(this),
         };
 
         this.onOpen(openContext)
@@ -389,7 +400,7 @@ class ReliableWebSocket<TMessage = RawData> {
           .catch((error) => {
             const message = `[${this.label}] onOpen failed: ${String(error)}`;
             this.logger.error(message);
-            this.fireNotify(message);
+            this.notify(message);
             websocket.terminate();
           });
       } else {
@@ -397,14 +408,16 @@ class ReliableWebSocket<TMessage = RawData> {
       }
     });
 
-    websocket.on("close", (code) => {
+    websocket.on("close", (code: number | undefined) => {
       clearTimers(this.connectionInfo);
       this.handleDisruption(code);
     });
 
-    websocket.on("error", (error) => {
+    websocket.on("error", (error: unknown) => {
       clearTimers(this.connectionInfo);
-      this.handleDisruption(undefined, error.message);
+      const message =
+        error instanceof Error ? error.message : String(error ?? "unknown");
+      this.handleDisruption(undefined, message);
     });
 
     websocket.on("message", (rawData: RawData) => {
@@ -417,8 +430,9 @@ class ReliableWebSocket<TMessage = RawData> {
       if (this.heartbeat?.isResponse(message)) {
         this.connectionInfo.missedPongCount = 0;
         this.connectionInfo.lastPongReceivedAt = Date.now();
-        clearTimeout(this.connectionInfo.pongTimeout);
-        this.connectionInfo.pongTimeout = undefined;
+        clearTimeout(this.connectionInfo.pongTimeoutId);
+        this.connectionInfo.pongTimeoutId = undefined;
+
         return;
       }
 
@@ -429,8 +443,9 @@ class ReliableWebSocket<TMessage = RawData> {
       if (waiterIndex !== -1) {
         const waiter = this.pendingWaiterList[waiterIndex];
         this.pendingWaiterList.splice(waiterIndex, 1);
-        clearTimeout(waiter.timeoutIdentifier);
+        clearTimeout(waiter.timeoutId);
         waiter.resolve(message);
+        
         return;
       }
 

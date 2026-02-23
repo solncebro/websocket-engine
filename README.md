@@ -18,7 +18,7 @@ npm install @solncebro/websocket-engine
 - **Heartbeat** — TCP ping/pong by default; or application-level JSON ping (e.g. Bybit `{ op: 'ping' }`)
 - **Connection timeout** — handshake timeout with retry
 - **Auth phase** — optional `onOpen` async callback for authentication before the connection is considered ready
-- **Send** — `controller.send(data)` for outbound messages
+- **Send** — `controller.sendToConnectedSocket(data)` for outbound messages
 - **Request/response** — `controller.waitForMessage(predicate, timeout)` to await a specific incoming message by any criteria (e.g. `reqId`)
 - **Typed messages** — optional `parseMessage` for type-safe payloads
 - **Notifications** — `onNotify` callback for alerts; process exits with code 1 after max retries (suitable for PM2 restart)
@@ -119,7 +119,7 @@ const controller = createReliableWebSocket<BybitMessage>({
 const sendOrder = async (orderParams: Record<string, unknown>) => {
   const reqId = `req_${Date.now()}`;
 
-  controller.send({
+  controller.sendToConnectedSocket({
     reqId,
     op: "order.create",
     args: [orderParams],
@@ -156,7 +156,7 @@ Returns a `ReliableWebSocketController<TMessage>`.
 |--------|-------------|
 | `close()` | Stops reconnection, clears timers, rejects pending waiters, closes the socket |
 | `getStatus()` | Returns current `WebSocketStatus` |
-| `send(data)` | Send data; `string` is sent as-is, anything else is `JSON.stringify`-ed. Throws if not connected. |
+| `sendToConnectedSocket(data)` | Send data; `string` is sent as-is, anything else is `JSON.stringify`-ed. Throws if not connected. |
 | `waitForMessage(predicate, timeoutMilliseconds)` | Returns a `Promise<TMessage>` that resolves with the first incoming message matching `predicate`. The message is **not** passed to `onMessage`. Rejects on timeout or connection close. |
 
 #### WebSocketStatus
@@ -173,7 +173,7 @@ Passed to `onOpen`:
 
 | Property | Description |
 |----------|-------------|
-| `send` | Same as `controller.send` |
+| `send` | Send to the open socket (for use during onOpen) |
 | `waitForMessage` | Same as `controller.waitForMessage` |
 
 #### WebSocketHeartbeatOptions

@@ -10,10 +10,10 @@ export interface ConnectionInfo {
   missedPongCount: number;
   hasEverConnected: boolean;
   connectionStartedAt?: number;
-  pingInterval?: NodeJS.Timeout;
-  pongTimeout?: NodeJS.Timeout;
-  reconnectTimeout?: NodeJS.Timeout;
-  connectionTimeout?: NodeJS.Timeout;
+  pingIntervalId?: NodeJS.Timeout;
+  pongTimeoutId?: NodeJS.Timeout;
+  reconnectTimeoutId?: NodeJS.Timeout;
+  connectionTimeoutId?: NodeJS.Timeout;
   lastPongReceivedAt?: number;
 }
 
@@ -22,24 +22,24 @@ export const isWebSocketClosable = (websocket: WebSocket): boolean =>
   websocket.readyState === WebSocket.CONNECTING;
 
 export const clearTimers = (connectionInfo: ConnectionInfo): void => {
-  if (connectionInfo.pingInterval) {
-    clearInterval(connectionInfo.pingInterval);
-    connectionInfo.pingInterval = undefined;
+  if (connectionInfo.pingIntervalId) {
+    clearInterval(connectionInfo.pingIntervalId);
+    connectionInfo.pingIntervalId = undefined;
   }
 
-  if (connectionInfo.pongTimeout) {
-    clearTimeout(connectionInfo.pongTimeout);
-    connectionInfo.pongTimeout = undefined;
+  if (connectionInfo.pongTimeoutId) {
+    clearTimeout(connectionInfo.pongTimeoutId);
+    connectionInfo.pongTimeoutId = undefined;
   }
 
-  if (connectionInfo.reconnectTimeout) {
-    clearTimeout(connectionInfo.reconnectTimeout);
-    connectionInfo.reconnectTimeout = undefined;
+  if (connectionInfo.reconnectTimeoutId) {
+    clearTimeout(connectionInfo.reconnectTimeoutId);
+    connectionInfo.reconnectTimeoutId = undefined;
   }
 
-  if (connectionInfo.connectionTimeout) {
-    clearTimeout(connectionInfo.connectionTimeout);
-    connectionInfo.connectionTimeout = undefined;
+  if (connectionInfo.connectionTimeoutId) {
+    clearTimeout(connectionInfo.connectionTimeoutId);
+    connectionInfo.connectionTimeoutId = undefined;
   }
 };
 
