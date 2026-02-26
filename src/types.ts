@@ -22,11 +22,11 @@ export interface WebSocketConfiguration {
 }
 
 export interface WebSocketLogger {
-  debug: (message: string) => void;
-  info: (message: string) => void;
-  warn: (message: string) => void;
-  error: (message: string) => void;
-  fatal: (message: string) => void;
+  debug: (message: string, ...args: unknown[]) => void;
+  info: (message: string, ...args: unknown[]) => void;
+  warn: (message: string, ...args: unknown[]) => void;
+  error: (message: string, ...args: unknown[]) => void;
+  fatal: (message: string, ...args: unknown[]) => void;
 }
 
 export interface WebSocketHeartbeatOptions<TMessage> {
