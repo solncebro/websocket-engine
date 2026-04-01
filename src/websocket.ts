@@ -1,20 +1,20 @@
-import { WebSocket } from "ws";
 import type { RawData } from "ws";
+import { WebSocket } from "ws";
 
 import { DEFAULT_WEBSOCKET_CONFIGURATION } from "./config";
 import type {
-  ReliableWebSocketArgs,
-  WebSocketConfiguration,
-  WebSocketHeartbeatOptions,
-  WebSocketLogger,
-  WebSocketOpenContext,
+    ReliableWebSocketArgs,
+    WebSocketConfiguration,
+    WebSocketHeartbeatOptions,
+    WebSocketLogger,
+    WebSocketOpenContext,
 } from "./types";
 import { WebSocketStatus } from "./types";
 import {
-  calcReconnectDelay,
-  clearTimers,
-  type ConnectionInfo,
-  isWebSocketClosable,
+    calcReconnectDelay,
+    clearTimers,
+    type ConnectionInfo,
+    isWebSocketClosable,
 } from "./websocket.utils";
 
 interface PendingWaiter<TMessage> {
@@ -251,7 +251,7 @@ class ReliableWebSocket<TMessage = RawData> {
         }
       }
 
-      const criticalMessage = `[${this.label}] CRITICAL: max retries (${this.configuration.maxRetryAttempts}) exceeded after ${this.connectionInfo.consecutiveFailures} consecutive failures — terminating process`;
+      const criticalMessage = `[${this.label}] CRITICAL: max retries (${this.configuration.maxRetryAttempts}) exceeded after ${this.connectionInfo.consecutiveFailures} consecutive failures`;
 
       this.logger.fatal(criticalMessage);
 
@@ -261,7 +261,7 @@ class ReliableWebSocket<TMessage = RawData> {
         this.logger.error(`[${this.label}] onNotify failed: ${String(error)}`);
       }
 
-      process.exit(1);
+      return;
     }
 
     try {
@@ -409,6 +409,13 @@ class ReliableWebSocket<TMessage = RawData> {
     });
 
     websocket.on("close", (code: number | undefined) => {
+      if (
+        this.connectionInfo.status === WebSocketStatus.DISCONNECTED ||
+        this.connectionInfo.status === WebSocketStatus.FAILED
+      ) {
+        return;
+      }
+
       clearTimers(this.connectionInfo);
       this.handleDisruption(code);
     });
@@ -436,16 +443,34 @@ class ReliableWebSocket<TMessage = RawData> {
         return;
       }
 
-      const waiterIndex = this.pendingWaiterList.findIndex((waiter) =>
-        waiter.predicate(message)
-      );
+      let matchedWaiterIndex = -1;
+      let predicateError: Error | undefined;
 
-      if (waiterIndex !== -1) {
-        const waiter = this.pendingWaiterList[waiterIndex];
-        this.pendingWaiterList.splice(waiterIndex, 1);
+      for (let i = 0; i < this.pendingWaiterList.length; i++) {
+        try {
+          if (this.pendingWaiterList[i].predicate(message)) {
+            matchedWaiterIndex = i;
+            break;
+          }
+        } catch (error) {
+          predicateError =
+            error instanceof Error ? error : new Error(String(error));
+          matchedWaiterIndex = i;
+          break;
+        }
+      }
+
+      if (matchedWaiterIndex !== -1) {
+        const waiter = this.pendingWaiterList[matchedWaiterIndex];
+        this.pendingWaiterList.splice(matchedWaiterIndex, 1);
         clearTimeout(waiter.timeoutId);
-        waiter.resolve(message);
-        
+
+        if (predicateError) {
+          waiter.reject(predicateError);
+        } else {
+          waiter.resolve(message);
+        }
+
         return;
       }
 
