@@ -1,5 +1,3 @@
-import { WebSocket } from "ws";
-
 import type { WebSocketConfiguration } from "./types";
 import { WebSocketStatus } from "./types";
 
@@ -10,11 +8,11 @@ export interface ConnectionInfo {
   missedPongCount: number;
   hasEverConnected: boolean;
   connectionStartedAt?: number;
-  pingIntervalId?: NodeJS.Timeout;
-  pongTimeoutId?: NodeJS.Timeout;
-  reconnectTimeoutId?: NodeJS.Timeout;
-  connectionTimeoutId?: NodeJS.Timeout;
-  lastPongReceivedAt?: number;
+  lastMessageAt?: number;
+  pingIntervalId?: ReturnType<typeof setTimeout>;
+  staleCheckIntervalId?: ReturnType<typeof setTimeout>;
+  reconnectTimeoutId?: ReturnType<typeof setTimeout>;
+  connectionTimeoutId?: ReturnType<typeof setTimeout>;
 }
 
 export const isWebSocketClosable = (websocket: WebSocket): boolean =>
@@ -27,9 +25,9 @@ export const clearTimers = (connectionInfo: ConnectionInfo): void => {
     connectionInfo.pingIntervalId = undefined;
   }
 
-  if (connectionInfo.pongTimeoutId) {
-    clearTimeout(connectionInfo.pongTimeoutId);
-    connectionInfo.pongTimeoutId = undefined;
+  if (connectionInfo.staleCheckIntervalId) {
+    clearInterval(connectionInfo.staleCheckIntervalId);
+    connectionInfo.staleCheckIntervalId = undefined;
   }
 
   if (connectionInfo.reconnectTimeoutId) {

@@ -1,6 +1,6 @@
 # @solncebro/websocket-engine
 
-Reliable WebSocket client for Node.js with automatic reconnection, ping/pong heartbeat, typed messages, optional authentication phase, and request/response pattern.
+Reliable, environment-agnostic WebSocket client with automatic reconnection, application-level heartbeat plus idle (stale) detection, typed messages, optional authentication phase, and request/response pattern. Built on the global `WebSocket`, so it runs unchanged in Node.js 22+, browsers, and React Native — no `ws` dependency.
 
 ## Installation
 
@@ -15,7 +15,7 @@ npm install @solncebro/websocket-engine
 ## Features
 
 - **Automatic reconnection** — exponential backoff with jitter; fast reconnect for specific close codes (1001, 1006, 1011–1014)
-- **Heartbeat** — TCP ping/pong by default; or application-level JSON ping (e.g. Bybit `{ op: 'ping' }`)
+- **Heartbeat** — application-level JSON ping (e.g. Bybit `{ op: 'ping' }`, Binance `{ method: 'LIST_SUBSCRIPTIONS' }`) paired with idle detection: the socket reconnects if no message arrives within `staleThreshold`. No TCP control frames are used, so it works on any WHATWG `WebSocket`.
 - **Connection timeout** — handshake timeout with retry
 - **Auth phase** — optional `onOpen` async callback for authentication before the connection is considered ready
 - **Send** — `ws.sendToConnectedSocket(data)` for outbound messages
@@ -25,7 +25,7 @@ npm install @solncebro/websocket-engine
 
 ## Requirements
 
-- Node.js 16+
+- Node.js 22+ (built-in global `WebSocket`), or any environment with a WHATWG `WebSocket` (browsers, React Native)
 - TypeScript 5.x (optional, for types)
 
 ## Usage
@@ -146,8 +146,9 @@ Creates a `ReliableWebSocket<TMessage>` instance. Connection starts immediately 
 | `parseMessage` | `(rawData: RawData) => TMessage` | No | Parse raw data to `TMessage`; default: pass-through |
 | `onOpen` | `(context: WebSocketOpenContext<TMessage>) => Promise<void>` | No | Async setup phase after connect (e.g. auth). Connection is not considered ready until this resolves. |
 | `onReconnectSuccess` | `() => void` | No | Called after a successful reconnection (not on first connect) |
+| `onClose` | `(context: WebSocketCloseContext) => void` | No | Called on every disruption, before the reconnect is scheduled, with the close/error details |
 | `onNotify` | `(message: string) => void \| Promise<void>` | No | Called on connection issues and when max retries exceeded |
-| `heartbeat` | `WebSocketHeartbeatOptions<TMessage>` | No | Application-level heartbeat (JSON ping/pong). When provided, TCP ping is disabled. |
+| `heartbeat` | `WebSocketHeartbeatOptions<TMessage>` | No | Application-level heartbeat (JSON ping/pong). When provided, an active ping is sent every `pingInterval` and idle detection is enabled. Without it, the socket relies on close/error events. |
 | `configuration` | `Partial<WebSocketConfiguration>` | No | Override default timeouts and retry behaviour |
 
 #### Instance Methods
@@ -184,6 +185,18 @@ Passed to `onOpen`:
 | `buildPayload` | Returns the JSON object to send as a ping |
 | `isResponse` | Returns `true` if the message is a pong. Matching messages are **not** passed to `onMessage`. |
 
+#### WebSocketCloseContext
+
+Passed to `onClose`:
+
+| Property | Type | Description |
+|----------|------|-------------|
+| `closeCode` | `number \| undefined` | Close code, when the disruption came from a `close` event |
+| `errorMessage` | `string \| undefined` | Error text, when the disruption came from an `error` event |
+| `consecutiveFailures` | `number` | Consecutive failed attempts so far |
+| `missedPongCount` | `number` | Consecutive stale checks with no incoming message |
+| `isPongTimeout` | `boolean` | `true` when `missedPongCount` has reached `missedPongThreshold` |
+
 ### Configuration (`configuration`)
 
 | Option | Default | Description |
@@ -193,11 +206,13 @@ Passed to `onOpen`:
 | `maxRetryDelay` | `30000` | Cap (ms) for backoff delay |
 | `retryDelayMultiplier` | `1.8` | Backoff multiplier |
 | `connectionTimeout` | `30000` | Handshake timeout (ms) |
-| `pingInterval` | `15000` | Ping interval (ms) |
+| `pingInterval` | `15000` | Active heartbeat ping interval (ms); only sent when `heartbeat` is set |
 | `pongTimeout` | `10000` | Pong wait timeout (ms) |
 | `heartbeatGracePeriod` | `3000` | Delay before first ping (ms) |
+| `staleThreshold` | `60000` | Reconnect if no incoming message (including ping responses) for this long (ms); requires `heartbeat` |
+| `staleCheckInterval` | `5000` | How often idle is checked (ms) |
 | `fastReconnectCodes` | `[1001, 1006, 1011, 1012, 1013, 1014]` | Close codes that use short reconnect delay |
-| `missedPongThreshold` | `3` | Missed pongs before terminating connection |
+| `missedPongThreshold` | `3` | Consecutive stale checks reflected in `isPongTimeout` of the close context |
 
 ## Behaviour
 
@@ -206,6 +221,7 @@ Passed to `onOpen`:
 - After **maxRetryAttempts** failed attempts, `onNotify` is awaited with a critical message and status becomes `FAILED`. The process is **not** terminated — the caller can check `getStatus()` and decide how to handle the failure.
 - `waitForMessage` pending promises are rejected when the connection is disrupted or `close()` is called.
 - Heartbeat response messages and `waitForMessage`-intercepted messages are **never** passed to `onMessage`.
+- With a `heartbeat`, the connection is also reconnected if no incoming message (including ping responses) arrives within `staleThreshold`. This catches a silently dead connection without relying on TCP-level control frames, which the global `WebSocket` cannot send from code.
 
 ## License
 

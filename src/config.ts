@@ -9,6 +9,8 @@ const DEFAULT_WEBSOCKET_CONFIGURATION: WebSocketConfiguration = {
   pingInterval: 15000,
   pongTimeout: 10000,
   heartbeatGracePeriod: 3000,
+  staleThreshold: 60000,
+  staleCheckInterval: 5000,
   fastReconnectCodes: [1001, 1006, 1011, 1012, 1013, 1014],
   missedPongThreshold: 3,
 };

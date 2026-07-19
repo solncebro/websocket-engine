@@ -1,27 +1,26 @@
-import type { RawData } from "ws";
-import { WebSocket } from "ws";
-
 import { DEFAULT_WEBSOCKET_CONFIGURATION } from "./config";
 import type {
-    ReliableWebSocketArgs,
-    WebSocketConfiguration,
-    WebSocketHeartbeatOptions,
-    WebSocketLogger,
-    WebSocketOpenContext,
+  RawData,
+  ReliableWebSocketArgs,
+  WebSocketCloseContext,
+  WebSocketConfiguration,
+  WebSocketHeartbeatOptions,
+  WebSocketLogger,
+  WebSocketOpenContext,
 } from "./types";
 import { WebSocketStatus } from "./types";
 import {
-    calcReconnectDelay,
-    clearTimers,
-    type ConnectionInfo,
-    isWebSocketClosable,
+  calcReconnectDelay,
+  clearTimers,
+  type ConnectionInfo,
+  isWebSocketClosable,
 } from "./websocket.utils";
 
 interface PendingWaiter<TMessage> {
   predicate: (message: TMessage) => boolean;
   resolve: (message: TMessage) => void;
   reject: (error: Error) => void;
-  timeoutId: NodeJS.Timeout;
+  timeoutId: ReturnType<typeof setTimeout>;
 }
 
 class ReliableWebSocket<TMessage = RawData> {
@@ -33,6 +32,7 @@ class ReliableWebSocket<TMessage = RawData> {
   private readonly parseMessage?: (rawData: RawData) => TMessage;
   private readonly onOpen?: (context: WebSocketOpenContext<TMessage>) => Promise<void>;
   private readonly onReconnectSuccess?: () => void;
+  private readonly onClose?: (context: WebSocketCloseContext) => void;
   private readonly onNotify?: (message: string) => void | Promise<void>;
   private readonly heartbeat?: WebSocketHeartbeatOptions<TMessage>;
   private readonly connectionInfo: ConnectionInfo;
@@ -52,6 +52,7 @@ class ReliableWebSocket<TMessage = RawData> {
     this.parseMessage = args.parseMessage;
     this.onOpen = args.onOpen;
     this.onReconnectSuccess = args.onReconnectSuccess;
+    this.onClose = args.onClose;
     this.onNotify = args.onNotify;
     this.heartbeat = args.heartbeat;
 
@@ -109,12 +110,11 @@ class ReliableWebSocket<TMessage = RawData> {
     clearTimers(this.connectionInfo);
     this.rejectPendingWaiters(`[${this.label}] Connection closed`);
 
-    if (this.currentWebSocket) {
-      this.currentWebSocket.removeAllListeners();
+    const websocket = this.currentWebSocket;
+    this.currentWebSocket = null;
 
-      if (isWebSocketClosable(this.currentWebSocket)) {
-        this.currentWebSocket.close();
-      }
+    if (websocket) {
+      this.closeSocket(websocket);
     }
   }
 
@@ -138,6 +138,18 @@ class ReliableWebSocket<TMessage = RawData> {
 
     const payload = typeof data === "string" ? data : JSON.stringify(data);
     this.currentWebSocket.send(payload);
+  }
+
+  private closeSocket(websocket: WebSocket): void {
+    if (!isWebSocketClosable(websocket)) {
+      return;
+    }
+
+    try {
+      websocket.close();
+    } catch (error) {
+      this.logger.error(`[${this.label}] Error closing socket: ${String(error)}`);
+    }
   }
 
   private notify(message: string): void {
@@ -191,6 +203,25 @@ class ReliableWebSocket<TMessage = RawData> {
     }, delay);
   }
 
+  /**
+   * Detach a failed socket before handling its disruption. A dead socket can
+   * emit `error` and then `close` back-to-back: without detaching, the trailing
+   * event clears the reconnect timer the first event just scheduled and the
+   * status guard in handleDisruption refuses to re-arm it, stranding the client.
+   * Returns false if the socket was already detached (later events are ignored).
+   */
+  private retireSocket(websocket: WebSocket): boolean {
+    if (websocket !== this.currentWebSocket) {
+      return false;
+    }
+
+    this.currentWebSocket = null;
+    clearTimers(this.connectionInfo);
+    this.closeSocket(websocket);
+
+    return true;
+  }
+
   private handleDisruption(closeCode?: number, errorMessage?: string): void {
     if (
       this.connectionInfo.status === WebSocketStatus.FAILED ||
@@ -214,6 +245,22 @@ class ReliableWebSocket<TMessage = RawData> {
     this.logger[level](message);
     this.notify(message);
 
+    if (this.onClose) {
+      try {
+        this.onClose({
+          closeCode,
+          errorMessage,
+          consecutiveFailures: this.connectionInfo.consecutiveFailures,
+          missedPongCount: this.connectionInfo.missedPongCount,
+          isPongTimeout:
+            this.connectionInfo.missedPongCount >=
+            this.configuration.missedPongThreshold,
+        });
+      } catch (error) {
+        this.logger.warn(`[${this.label}] onClose handler failed: ${String(error)}`);
+      }
+    }
+
     const delay = calcReconnectDelay(
       this.connectionInfo.consecutiveFailures,
       closeCode,
@@ -225,6 +272,7 @@ class ReliableWebSocket<TMessage = RawData> {
   private async performReconnect(): Promise<void> {
     if (this.connectionInfo.status === WebSocketStatus.RECONNECTING) {
       this.logger.debug(`[${this.label}] Already reconnecting, skipping`);
+
       return;
     }
 
@@ -244,11 +292,8 @@ class ReliableWebSocket<TMessage = RawData> {
       this.rejectPendingWaiters(`[${this.label}] Max retries exceeded`);
 
       if (this.currentWebSocket) {
-        this.currentWebSocket.removeAllListeners();
-
-        if (isWebSocketClosable(this.currentWebSocket)) {
-          this.currentWebSocket.terminate();
-        }
+        this.closeSocket(this.currentWebSocket);
+        this.currentWebSocket = null;
       }
 
       const criticalMessage = `[${this.label}] CRITICAL: max retries (${this.configuration.maxRetryAttempts}) exceeded after ${this.connectionInfo.consecutiveFailures} consecutive failures`;
@@ -266,11 +311,7 @@ class ReliableWebSocket<TMessage = RawData> {
 
     try {
       if (this.currentWebSocket) {
-        this.currentWebSocket.removeAllListeners();
-
-        if (isWebSocketClosable(this.currentWebSocket)) {
-          this.currentWebSocket.terminate();
-        }
+        this.closeSocket(this.currentWebSocket);
       }
 
       this.connect();
@@ -288,194 +329,212 @@ class ReliableWebSocket<TMessage = RawData> {
 
   private setupHeartbeat(websocket: WebSocket): void {
     clearInterval(this.connectionInfo.pingIntervalId);
-    clearTimeout(this.connectionInfo.pongTimeoutId);
+    clearInterval(this.connectionInfo.staleCheckIntervalId);
     this.connectionInfo.pingIntervalId = undefined;
-    this.connectionInfo.pongTimeoutId = undefined;
+    this.connectionInfo.staleCheckIntervalId = undefined;
     this.connectionInfo.missedPongCount = 0;
-    this.connectionInfo.lastPongReceivedAt = Date.now();
+    this.connectionInfo.lastMessageAt = Date.now();
 
     const heartbeat = this.heartbeat;
-    const sendApplicationPing = heartbeat
-      ? () => this.sendToOpenedSocket(heartbeat.buildPayload())
-      : undefined;
+
+    if (!heartbeat) {
+      return;
+    }
 
     const sendPing = (): void => {
-      if (websocket.readyState !== WebSocket.OPEN) {
+      if (
+        websocket !== this.currentWebSocket ||
+        websocket.readyState !== WebSocket.OPEN
+      ) {
         return;
       }
 
       try {
-        sendApplicationPing ? sendApplicationPing() : websocket.ping();
-
-        this.connectionInfo.pongTimeoutId = setTimeout(() => {
-          this.connectionInfo.missedPongCount++;
-
-          if (
-            this.connectionInfo.missedPongCount >=
-            this.configuration.missedPongThreshold
-          ) {
-            this.logger.warn(
-              `[${this.label}] Missed ${this.connectionInfo.missedPongCount} pongs, terminating`
-            );
-            websocket.terminate();
-          } else {
-            this.logger.warn(
-              `[${this.label}] Pong timeout (${this.connectionInfo.missedPongCount}/${this.configuration.missedPongThreshold})`
-            );
-          }
-        }, this.configuration.pongTimeout);
+        this.sendToOpenedSocket(heartbeat.buildPayload());
       } catch (error) {
         this.logger.error(`[${this.label}] Error sending ping: ${String(error)}`);
       }
     };
 
-    if (!sendApplicationPing) {
-      websocket.removeAllListeners("pong");
-      websocket.on("pong", () => {
+    const checkStale = (): void => {
+      if (websocket !== this.currentWebSocket) {
+        return;
+      }
+
+      const lastMessageAt = this.connectionInfo.lastMessageAt ?? Date.now();
+      const idleMs = Date.now() - lastMessageAt;
+
+      if (idleMs <= this.configuration.staleThreshold) {
         this.connectionInfo.missedPongCount = 0;
-        this.connectionInfo.lastPongReceivedAt = Date.now();
-        clearTimeout(this.connectionInfo.pongTimeoutId);
-        this.connectionInfo.pongTimeoutId = undefined;
-      });
-    }
+
+        return;
+      }
+
+      this.connectionInfo.missedPongCount++;
+      this.logger.warn(
+        `[${this.label}] Stale connection: no messages for ${Math.floor(idleMs / 1000)}s, reconnecting`
+      );
+      this.retireSocket(websocket);
+      this.handleDisruption(undefined, `stale ${Math.floor(idleMs / 1000)}s`);
+    };
 
     setTimeout(sendPing, this.configuration.heartbeatGracePeriod);
     this.connectionInfo.pingIntervalId = setInterval(
       sendPing,
       this.configuration.pingInterval
     );
+    this.connectionInfo.staleCheckIntervalId = setInterval(
+      checkStale,
+      this.configuration.staleCheckInterval
+    );
   }
 
   private connect(): void {
-    const websocket = new WebSocket(this.url, {
-      handshakeTimeout: this.configuration.connectionTimeout,
-    });
+    const websocket = new WebSocket(this.url);
 
     this.currentWebSocket = websocket;
 
     this.connectionInfo.connectionTimeoutId = setTimeout(() => {
-      if (websocket.readyState === WebSocket.CONNECTING) {
+      if (
+        websocket === this.currentWebSocket &&
+        websocket.readyState === WebSocket.CONNECTING
+      ) {
         const message = this.formatRetryAttemptMessage(
           `Connection timeout after ${this.configuration.connectionTimeout}ms`
         );
         this.logger.warn(message);
         this.notify(message);
-        websocket.terminate();
+        this.retireSocket(websocket);
+        this.handleDisruption(undefined, "connection timeout");
       }
     }, this.configuration.connectionTimeout);
 
-    websocket.on("open", () => {
-      clearTimeout(this.connectionInfo.connectionTimeoutId);
-      this.connectionInfo.connectionTimeoutId = undefined;
+    websocket.addEventListener("open", () => {
+      if (websocket !== this.currentWebSocket) {
+        return;
+      }
 
-      const afterOpen = (): void => {
-        this.connectionInfo.status = WebSocketStatus.CONNECTED;
-        this.connectionInfo.connectionStartedAt = Date.now();
-        this.connectionInfo.retryCount = 0;
-        this.connectionInfo.consecutiveFailures = 0;
-        this.connectionInfo.missedPongCount = 0;
+      this.handleOpen(websocket);
+    });
 
-        const isFirstConnection = !this.connectionInfo.hasEverConnected;
-        this.connectionInfo.hasEverConnected = true;
+    websocket.addEventListener("message", (event) => {
+      if (websocket !== this.currentWebSocket) {
+        return;
+      }
 
-        this.logger.info(
-          `[${this.label}] ${isFirstConnection ? "Connected" : "Reconnected"} successfully`
-        );
+      this.handleIncoming(event.data);
+    });
 
-        this.setupHeartbeat(websocket);
+    websocket.addEventListener("close", (event) => {
+      if (!this.retireSocket(websocket)) {
+        return;
+      }
 
-        if (!isFirstConnection) {
-          this.onReconnectSuccess?.();
-        }
+      this.handleDisruption(event.code);
+    });
+
+    websocket.addEventListener("error", () => {
+      if (!this.retireSocket(websocket)) {
+        return;
+      }
+
+      this.handleDisruption(undefined, "websocket error");
+    });
+  }
+
+  private handleOpen(websocket: WebSocket): void {
+    clearTimeout(this.connectionInfo.connectionTimeoutId);
+    this.connectionInfo.connectionTimeoutId = undefined;
+
+    const afterOpen = (): void => {
+      this.connectionInfo.status = WebSocketStatus.CONNECTED;
+      this.connectionInfo.connectionStartedAt = Date.now();
+      this.connectionInfo.retryCount = 0;
+      this.connectionInfo.consecutiveFailures = 0;
+      this.connectionInfo.missedPongCount = 0;
+      this.connectionInfo.lastMessageAt = Date.now();
+
+      const isFirstConnection = !this.connectionInfo.hasEverConnected;
+      this.connectionInfo.hasEverConnected = true;
+
+      this.logger.info(
+        `[${this.label}] ${isFirstConnection ? "Connected" : "Reconnected"} successfully`
+      );
+
+      this.setupHeartbeat(websocket);
+
+      if (!isFirstConnection) {
+        this.onReconnectSuccess?.();
+      }
+    };
+
+    if (this.onOpen) {
+      const openContext: WebSocketOpenContext<TMessage> = {
+        send: this.sendToOpenedSocket.bind(this),
+        waitForMessage: this.waitForMessage.bind(this),
       };
 
-      if (this.onOpen) {
-        const openContext: WebSocketOpenContext<TMessage> = {
-          send: this.sendToOpenedSocket.bind(this),
-          waitForMessage: this.waitForMessage.bind(this),
-        };
+      this.onOpen(openContext)
+        .then(afterOpen)
+        .catch((error) => {
+          const message = `[${this.label}] onOpen failed: ${String(error)}`;
+          this.logger.error(message);
+          this.notify(message);
+          this.retireSocket(websocket);
+          this.handleDisruption(undefined, "onOpen failed");
+        });
 
-        this.onOpen(openContext)
-          .then(afterOpen)
-          .catch((error) => {
-            const message = `[${this.label}] onOpen failed: ${String(error)}`;
-            this.logger.error(message);
-            this.notify(message);
-            websocket.terminate();
-          });
-      } else {
-        afterOpen();
-      }
-    });
+      return;
+    }
 
-    websocket.on("close", (code: number | undefined) => {
-      if (
-        this.connectionInfo.status === WebSocketStatus.DISCONNECTED ||
-        this.connectionInfo.status === WebSocketStatus.FAILED
-      ) {
-        return;
-      }
+    afterOpen();
+  }
 
-      clearTimers(this.connectionInfo);
-      this.handleDisruption(code);
-    });
+  private handleIncoming(data: RawData): void {
+    this.connectionInfo.lastMessageAt = Date.now();
 
-    websocket.on("error", (error: unknown) => {
-      clearTimers(this.connectionInfo);
-      const message =
-        error instanceof Error ? error.message : String(error ?? "unknown");
-      this.handleDisruption(undefined, message);
-    });
+    const message = this.resolveMessage(data);
 
-    websocket.on("message", (rawData: RawData) => {
-      const message = this.resolveMessage(rawData);
+    if (message === undefined) {
+      return;
+    }
 
-      if (message === undefined) {
-        return;
-      }
+    if (this.heartbeat?.isResponse(message)) {
+      return;
+    }
 
-      if (this.heartbeat?.isResponse(message)) {
-        this.connectionInfo.missedPongCount = 0;
-        this.connectionInfo.lastPongReceivedAt = Date.now();
-        clearTimeout(this.connectionInfo.pongTimeoutId);
-        this.connectionInfo.pongTimeoutId = undefined;
+    let matchedWaiterIndex = -1;
+    let predicateError: Error | undefined;
 
-        return;
-      }
-
-      let matchedWaiterIndex = -1;
-      let predicateError: Error | undefined;
-
-      for (let i = 0; i < this.pendingWaiterList.length; i++) {
-        try {
-          if (this.pendingWaiterList[i].predicate(message)) {
-            matchedWaiterIndex = i;
-            break;
-          }
-        } catch (error) {
-          predicateError =
-            error instanceof Error ? error : new Error(String(error));
+    for (let i = 0; i < this.pendingWaiterList.length; i++) {
+      try {
+        if (this.pendingWaiterList[i].predicate(message)) {
           matchedWaiterIndex = i;
           break;
         }
+      } catch (error) {
+        predicateError =
+          error instanceof Error ? error : new Error(String(error));
+        matchedWaiterIndex = i;
+        break;
+      }
+    }
+
+    if (matchedWaiterIndex !== -1) {
+      const waiter = this.pendingWaiterList[matchedWaiterIndex];
+      this.pendingWaiterList.splice(matchedWaiterIndex, 1);
+      clearTimeout(waiter.timeoutId);
+
+      if (predicateError) {
+        waiter.reject(predicateError);
+      } else {
+        waiter.resolve(message);
       }
 
-      if (matchedWaiterIndex !== -1) {
-        const waiter = this.pendingWaiterList[matchedWaiterIndex];
-        this.pendingWaiterList.splice(matchedWaiterIndex, 1);
-        clearTimeout(waiter.timeoutId);
+      return;
+    }
 
-        if (predicateError) {
-          waiter.reject(predicateError);
-        } else {
-          waiter.resolve(message);
-        }
-
-        return;
-      }
-
-      this.onMessage(message);
-    });
+    this.onMessage(message);
   }
 }
 

@@ -1,4 +1,4 @@
-import type { RawData } from "ws";
+export type RawData = string | ArrayBuffer | ArrayBufferView;
 
 export enum WebSocketStatus {
   CONNECTING = "connecting",
@@ -17,6 +17,8 @@ export interface WebSocketConfiguration {
   pingInterval: number;
   pongTimeout: number;
   heartbeatGracePeriod: number;
+  staleThreshold: number;
+  staleCheckInterval: number;
   fastReconnectCodes: number[];
   missedPongThreshold: number;
 }
@@ -42,6 +44,14 @@ export interface WebSocketOpenContext<TMessage> {
   ) => Promise<TMessage>;
 }
 
+export interface WebSocketCloseContext {
+  closeCode?: number;
+  errorMessage?: string;
+  consecutiveFailures: number;
+  missedPongCount: number;
+  isPongTimeout: boolean;
+}
+
 export interface ReliableWebSocketArgs<TMessage = RawData> {
   url: string;
   label: string;
@@ -50,6 +60,7 @@ export interface ReliableWebSocketArgs<TMessage = RawData> {
   parseMessage?: (rawData: RawData) => TMessage;
   onOpen?: (context: WebSocketOpenContext<TMessage>) => Promise<void>;
   onReconnectSuccess?: () => void;
+  onClose?: (context: WebSocketCloseContext) => void;
   onNotify?: (message: string) => void | Promise<void>;
   configuration?: Partial<WebSocketConfiguration>;
   heartbeat?: WebSocketHeartbeatOptions<TMessage>;
